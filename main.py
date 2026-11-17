@@ -53,7 +53,7 @@ STOP_BPS = 200
 TIME_STOP_BARS = 240
 # Fallback: one small late trade so a calm window still records a trade.
 FALLBACK_BAR = 1320
-FALLBACK_R60_BPS = -50
+FALLBACK_R60_BPS = 50
 FALLBACK_NUM = 1
 FALLBACK_DEN = 4
 # A fill more than 3% from the latest close is refused.
@@ -74,6 +74,9 @@ class FadeBot:
         self.entry_seq = None
         # How many of our own buy orders have filled so far.
         self.trades = 0
+        # Fallback bookkeeping: one-shot unless its order was rejected.
+        self.fallback_done = False
+        self.fallback_cid = None
         self._n = 0
 
     def _close(self, state):
@@ -85,10 +88,14 @@ class FadeBot:
 
     def _record_fills(self, state, batch):
         for fill in batch.get("fills", []):
-            if fill.get("status") != "filled":
-                continue
             cid = fill.get("client_id", "")
             if not cid.startswith("fade-"):
+                continue
+            if fill.get("status") == "rejected" and cid == self.fallback_cid:
+                # A rejected fallback may be tried again on a later bar.
+                self.fallback_done = False
+                self.fallback_cid = None
+            if fill.get("status") != "filled":
                 continue
             if fill.get("side") == "buy":
                 scale = state.symbols[SYMBOL]["price_scale"]
@@ -102,6 +109,14 @@ class FadeBot:
 
     def on_batch(self, state, batch):
         self._record_fills(state, batch)
+        # Only trade on a fresh bar: if this batch carries no bar for the
+        # symbol, state.latest still holds the previous bar, so a decision
+        # here would repeat stale data. Fills were already recorded above.
+        if not any(b.get("symbol") == SYMBOL for b in batch.get("bars", [])):
+            if not self._holding(state):
+                self.entry_price = None
+                self.entry_seq = None
+            return []
         close = self._close(state)
         if close is None:
             return []
@@ -111,6 +126,10 @@ class FadeBot:
         n = len(self.closes)
         if self._holding(state):
             return self._maybe_exit(state, close, n)
+        # Flat: drop any entry metadata left over from a closed position,
+        # so a later position never inherits a stale fill price or timing.
+        self.entry_price = None
+        self.entry_seq = None
         return self._maybe_enter(state, close, n)
 
     def _maybe_exit(self, state, close, n):
@@ -125,7 +144,7 @@ class FadeBot:
             close >= entry * (1.0 + REC_BPS / 10000.0)
             or r60 > EXIT_R60_BPS
             or close <= entry * (1.0 - STOP_BPS / 10000.0)
-            or held > TIME_STOP_BARS
+            or held >= TIME_STOP_BARS
         ):
             self._n += 1
             return [
@@ -160,16 +179,19 @@ class FadeBot:
         # Fallback: one small late trade if the window stayed calm.
         if (
             self.trades == 0
+            and not self.fallback_done
             and state.seq >= FALLBACK_BAR
             and r60 < -FALLBACK_R60_BPS
         ):
             amount = cash * FALLBACK_NUM // FALLBACK_DEN
             if amount >= min_notional:
                 self._n += 1
+                self.fallback_done = True
+                self.fallback_cid = "fade-buy-%d" % self._n
                 return [
                     {
                         "side": "buy",
-                        "client_id": "fade-buy-%d" % self._n,
+                        "client_id": self.fallback_cid,
                         "symbol": SYMBOL,
                         "notional_quote_units": amount,
                         "max_slippage_bps": MAX_SLIPPAGE_BPS,
